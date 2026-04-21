@@ -60,11 +60,9 @@ def updated_latest_weight_average(model_parameters, model_buffers, store, last_k
     return param_store, buffer_store
 
 
-def prepare_pretraining_dataloader(dataset, tokenizer, cfg_train, cfg_impl):
-
-    num_workers = get_num_workers(cfg_impl)
+def _get_pretraining_collate_fn(tokenizer, cfg_train):
     if cfg_train.objective.name == "masked-lm":
-        collate_fn = PatchedDataCollatorForLanguageModeling(
+        return PatchedDataCollatorForLanguageModeling(
             tokenizer=tokenizer,
             mlm=not cfg_train.objective.disable_mlm,
             mlm_probability=cfg_train.objective.mlm_probability,
@@ -72,15 +70,21 @@ def prepare_pretraining_dataloader(dataset, tokenizer, cfg_train, cfg_impl):
             use_80_20_rule=cfg_train.objective.use_80_20_rule,
             token_drop=cfg_train.objective.token_drop,
         )
-    else:
-        collate_fn = None
+    return None
+
+
+def prepare_pretraining_dataloader(dataset, tokenizer, cfg_train, cfg_impl, infinite=True, shuffle=None):
+
+    num_workers = get_num_workers(cfg_impl)
+    collate_fn = _get_pretraining_collate_fn(tokenizer, cfg_train)
+    shuffle = cfg_impl.shuffle_in_dataloader if shuffle is None else shuffle
 
     if isinstance(dataset, torch.utils.data.IterableDataset):
         # streaming mode for ready-made datasets, speed not tested
         if torch.distributed.is_initialized():
             dataset = split_dataset_by_node(dataset, rank=int(os.environ["RANK"]), world_size=int(os.environ["WORLD_SIZE"]))
 
-        if cfg_impl.shuffle_in_dataloader:
+        if shuffle:
             dataset = dataset.shuffle(seed=42, buffer_size=256)
         else:
             num_workers = 1  # ordered data is not loaded correctly with multiple workers in this case
@@ -92,29 +96,30 @@ def prepare_pretraining_dataloader(dataset, tokenizer, cfg_train, cfg_impl):
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.distributed.DistributedSampler(
                 dataset,
-                shuffle=cfg_impl.shuffle_in_dataloader,
-                drop_last=True,
+                shuffle=shuffle,
+                drop_last=infinite,
             )
         else:
-            if cfg_impl.shuffle_in_dataloader:
+            if shuffle:
                 sampler = torch.utils.data.RandomSampler(dataset)
             else:
                 sampler = torch.utils.data.SequentialSampler(dataset)
         if cfg_train.reverse_dataset_order:
             dataset = dataset.select(reversed(range(len(dataset))))
 
-    repeated_dataloader = InfiniteDataLoader(
+    dataloader_type = InfiniteDataLoader if infinite else DataLoader
+    dataloader = dataloader_type(
         dataset,
         sampler=sampler,
         batch_size=cfg_impl.microbatch_size,
         num_workers=num_workers,
         pin_memory=cfg_impl.pin_memory,
-        drop_last=True,
+        drop_last=infinite,
         prefetch_factor=cfg_impl.prefetch_factor if num_workers > 0 else None,
-        persistent_workers=cfg_impl.persistent_workers if num_workers > 0 else False,
+        persistent_workers=cfg_impl.persistent_workers if (num_workers > 0 and infinite) else False,
         collate_fn=collate_fn,
     )
-    return repeated_dataloader
+    return dataloader
 
 
 def prepare_downstream_dataloader(dataset, tokenizer, mode, cfg_impl):

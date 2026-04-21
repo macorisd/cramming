@@ -26,6 +26,7 @@ z_loss_factor: 0
 embedding:
   vocab_size: # will be populated automatically
   pos_embedding: scaled-sinusoidal
+  positional_wave: sinusoid
   dropout_prob: 0.1 # equal to hidden_dropout_prob in BERT
   pad_token_id: 0
   max_seq_length: 128 # max seq length that the positional embedding is instantiated for

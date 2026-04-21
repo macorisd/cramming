@@ -58,6 +58,24 @@ This command pre-processes a small sanity-check dataset, and runs a single train
 
 Use the `pretrain.py` script to pretrain with limited compute. This repository uses hydra (https://hydra.cc/docs/intro/), so all fields in `cramming/config` can be modified on the command line. For example, the `budget` can be modified by providing `budget=48` as additional argument (to run for 48 hours), or the learning rate can be modified via `train.optim.lr=1e-4`. Check out the configuration folder to see all arguments.
 
+Absolute sinusoidal position embeddings also expose `arch.embedding.positional_wave`, which accepts `sinusoid`, `triangular`, `square`, and `sawtooth`. For example:
+```
+python3 pretrain.py name=crammed_triangular arch=crammed-bert train=bert-o4 data=sanity-check-2 dryrun=True arch.embedding.positional_wave=triangular
+```
+
+If you want to launch the same training recipe across several folds and waves while still reusing `pretrain.py`, use:
+```
+python3 scripts/train_kfold_positional_waves.py \
+  --base-name crammed_cv \
+  --folds 5 \
+  --waves sinusoid,triangular,square,sawtooth \
+  --fold-data-template my-corpus-fold{fold} \
+  --arch crammed-bert \
+  --train bert-o4 \
+  --base-dir outputs
+```
+For true k-fold cross-validation, prepare one Hydra data config per fold and reference it via `--fold-data-template`.
+
 Your first step should be to verify the installed packages. To do so, you can run `python pretrain.py dryrun=True`, which will run the default sanity check for a single iteration. From there, you can enable additional functionality. For example, modify the architecture, e.g. `arch=bert-original` and training setup `train=bert-original`.
 To really train a language model, you need to switch away from the sanity check dataset to at least `data=pile-readymade`. Then, choose an improved training setup, e.g. `train=bert-o4`, and an improved model layout, e.g. `arch=crammed-bert`.
 

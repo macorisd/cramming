@@ -26,3 +26,10 @@ name: default # A name for this run [will be used for the summary table and outp
 budget: 24
 # debug implementation by running every loop just once:
 dryrun: False
+
+validation:
+  enabled: True
+  split: 0.01
+  interval: 1000
+  max_batches:
+  seed: 89

@@ -14,6 +14,10 @@ log = logging.getLogger(__name__)
 
 def construct_model(cfg_arch, vocab_size, downstream_classes=None):
     model = None
+    embedding_cfg = cfg_arch.get("embedding", None)
+    if embedding_cfg is not None and embedding_cfg.get("pos_embedding") in {"sinusoidal", "scaled-sinusoidal"} and is_main_process():
+        positional_wave = embedding_cfg.get("positional_wave", "sinusoid")
+        log.info(f"Using absolute positional encoding '{embedding_cfg.pos_embedding}' with wave '{positional_wave}'.")
     if cfg_arch.architectures is not None:
         # attempt to solve locally
         if "ScriptableCrammedBERT" in cfg_arch.architectures:
