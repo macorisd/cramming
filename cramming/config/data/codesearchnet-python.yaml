@@ -1,0 +1,34 @@
+name: codesearchnet-python
+sources:
+  codesearchnet_python:
+    provider: local
+    file_type: text
+    files: /mnt2/fscratch/users/tic_163_uma/macorisd/datasets/alt_waves/codesearchnet_python/cramming.txt
+    split: train
+    streaming: False
+    remove_columns:
+    concatenate_successive_entries: 0
+
+normalizer:
+  force_lowercase: False
+  strip_accents: False
+  force_english_keyboard: False
+  whitespace_escape: False
+tokenizer: BPE
+vocab_size: 32768
+
+seq_length: 128
+include_cls_token_in_corpus: False
+include_sep_token_in_corpus: True
+use_type_ids: False
+max_entries_in_raw_dataset: 1e10
+max_seq_in_tokenized_dataset: 5e6
+
+named_entity_simplification: False
+remove_whitespaces: False
+remove_trash: False
+trash_cutoff: 0.3
+deduplicate_entries: False
+deduplication_threshold: 100
+
+ordering: randomized

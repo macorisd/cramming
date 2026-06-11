@@ -5,6 +5,8 @@ import math
 from typing import Tuple
 from einops import repeat
 
+SUPPORTED_POSITIONAL_WAVES = ("sinusoid", "triangular", "square", "sawtooth")
+
 # module partially stolen from pytorch examples:
 class SinusoidalPositional(torch.nn.Module):
     r"""Inject some information about the relative or absolute position of the tokens
@@ -13,17 +15,70 @@ class SinusoidalPositional(torch.nn.Module):
     functions of different frequencies.
     """
 
-    def __init__(self, embedding_dim, max_seq_length=5000):
+    def __init__(self, embedding_dim, max_seq_length=5000, periodic_func="sinusoid"):
         super().__init__()
+        self.periodic_func = periodic_func
 
-        pe = torch.zeros(max_seq_length, embedding_dim)
-        position = torch.arange(0, max_seq_length, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, embedding_dim, 2).float() * (-math.log(10000.0) / embedding_dim))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = self._build_periodic_encoding(embedding_dim, max_seq_length, periodic_func)
 
         pe = pe.unsqueeze(0)
         self.register_buffer("pe", pe, persistent=False)
+
+    @staticmethod
+    def _scaled_positions(position, embedding_dim, offset):
+        channel_indices = torch.arange(offset, embedding_dim, 2, dtype=position.dtype, device=position.device)
+        return position / (10000 ** (channel_indices / embedding_dim))
+
+    @classmethod
+    def _build_periodic_encoding(cls, embedding_dim, max_seq_length, periodic_func):
+        if periodic_func not in SUPPORTED_POSITIONAL_WAVES:
+            raise ValueError(
+                f"Unknown positional wave '{periodic_func}'. Use one of {', '.join(SUPPORTED_POSITIONAL_WAVES)}."
+            )
+
+        pe = torch.zeros(max_seq_length, embedding_dim)
+        position = torch.arange(0, max_seq_length, dtype=torch.float).unsqueeze(1)
+        z_even = cls._scaled_positions(position, embedding_dim, 0)
+        z_odd = cls._scaled_positions(position, embedding_dim, 1)
+
+        if periodic_func == "sinusoid":
+            pe[:, 0::2] = torch.sin(z_even)
+            pe[:, 1::2] = torch.cos(z_odd)
+            return pe
+
+        wave_fn = {
+            "triangular": cls._triangular_wave,
+            "square": cls._square_wave,
+            "sawtooth": cls._sawtooth_wave,
+        }[periodic_func]
+        pe[:, 0::2] = wave_fn(z_even)
+        pe[:, 1::2] = wave_fn(z_odd)
+        return pe
+
+    @staticmethod
+    def _triangular_wave(z):
+        z_mod = torch.remainder(z, 2 * math.pi)
+        pi = math.pi
+        out = torch.empty_like(z_mod)
+
+        cond1 = (z_mod >= 0) & (z_mod < 0.5 * pi)
+        cond2 = (z_mod >= 0.5 * pi) & (z_mod < 1.5 * pi)
+        cond3 = (z_mod >= 1.5 * pi) & (z_mod < 2.0 * pi)
+
+        out[cond1] = (2.0 * z_mod[cond1]) / pi
+        out[cond2] = (-2.0 * z_mod[cond2]) / pi + 2.0
+        out[cond3] = (2.0 * z_mod[cond3]) / pi - 4.0
+        return out
+
+    @staticmethod
+    def _square_wave(z):
+        z_mod = torch.remainder(z, 2 * math.pi)
+        return torch.where(z_mod < math.pi, -torch.ones_like(z_mod), torch.ones_like(z_mod))
+
+    @staticmethod
+    def _sawtooth_wave(z):
+        z_mod = torch.remainder(z, 2 * math.pi)
+        return torch.where(z_mod <= math.pi, z_mod, z_mod - 2 * math.pi)
 
     def forward(self, input_ids):
         r"""Inputs of forward function
@@ -41,8 +96,8 @@ class SinusoidalPositional(torch.nn.Module):
 class ScaledSinosoidal(SinusoidalPositional):
     """Sinusoidal with scaling (see FLASH paper)."""
 
-    def __init__(self, embedding_dim, max_seq_length):
-        super().__init__(embedding_dim, max_seq_length)
+    def __init__(self, embedding_dim, max_seq_length, periodic_func="sinusoid"):
+        super().__init__(embedding_dim, max_seq_length, periodic_func=periodic_func)
         self.scale_factor = torch.nn.Parameter(torch.tensor([1.0 / embedding_dim**0.5]))
 
     def forward(self, input_ids):

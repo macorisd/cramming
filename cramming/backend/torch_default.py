@@ -15,14 +15,28 @@ import os
 import json
 from omegaconf import OmegaConf
 from functools import partial
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import time
+import tempfile
 
 import logging
 
 import transformers
 from safetensors.torch import load_file, save_file
-from transformers.utils.generic import working_or_temp_dir
+
+try:
+    from transformers.utils.generic import working_or_temp_dir
+except ImportError:
+
+    @contextmanager
+    def working_or_temp_dir(working_dir, use_temp_dir=False):
+        """Compatibility shim for newer transformers releases."""
+        if use_temp_dir:
+            with tempfile.TemporaryDirectory() as work_dir:
+                yield work_dir
+        else:
+            os.makedirs(working_dir, exist_ok=True)
+            yield working_dir
 
 
 from .utils import group_parameters, prepare_pretraining_dataloader, update_ema, updated_latest_weight_average
@@ -289,7 +303,7 @@ class TorchEngineMinimal(torch.nn.Module):
 
     def save_final_model(self, base_directory, identifier, tokenizer, cfg_arch, dryrun=False):
         """This checkpoint can be used for downstream tasks.
-        The default behavior is to save this checkpoint to a checkpoints folder under base_directory/name/checkpoints"""
+        The default behavior is to save this checkpoint to a checkpoints folder under the active run directory."""
         try:
             identifier_str = f"{identifier:2.4f}"
         except ValueError:

@@ -15,15 +15,20 @@ INPLACE = False
 class EmbeddingComponent(torch.nn.Module):
     def __init__(self, cfg_embedding, norm, norm_eps):
         super().__init__()
+        positional_wave = cfg_embedding.get("positional_wave", "sinusoid")
         self.word_embedding = torch.nn.Embedding(
             cfg_embedding.vocab_size, cfg_embedding.embedding_dim, padding_idx=cfg_embedding.pad_token_id
         )
         if cfg_embedding.pos_embedding == "learned":
             self.pos_embedding = LearnablePositional(cfg_embedding.embedding_dim, cfg_embedding.max_seq_length)
         elif cfg_embedding.pos_embedding == "sinusoidal":
-            self.pos_embedding = SinusoidalPositional(cfg_embedding.embedding_dim, cfg_embedding.max_seq_length)
+            self.pos_embedding = SinusoidalPositional(
+                cfg_embedding.embedding_dim, cfg_embedding.max_seq_length, periodic_func=positional_wave
+            )
         elif cfg_embedding.pos_embedding == "scaled-sinusoidal":
-            self.pos_embedding = ScaledSinosoidal(cfg_embedding.embedding_dim, cfg_embedding.max_seq_length)
+            self.pos_embedding = ScaledSinosoidal(
+                cfg_embedding.embedding_dim, cfg_embedding.max_seq_length, periodic_func=positional_wave
+            )
         else:
             self.pos_embedding = None
 

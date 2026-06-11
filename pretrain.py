@@ -10,6 +10,7 @@ import logging
 from collections import defaultdict
 
 import cramming
+from cramming.backend.utils import prepare_pretraining_dataloader
 
 log = logging.getLogger(__name__)
 
@@ -19,7 +20,8 @@ def main_training_process(cfg, setup):
     local_time = time.time()
     model = cramming.construct_model(cfg.arch, cfg.data.vocab_size)
     dataset, tokenizer = cramming.load_pretraining_corpus(cfg.data, cfg.impl)
-    checkpoint_rendevous = os.path.join(cfg.base_dir, cfg.name, "intermediate_state.pth")
+    train_dataset, eval_dataset = split_pretraining_dataset(dataset, cfg.validation, cfg.k_fold)
+    checkpoint_rendevous = os.path.join(cfg.run_dir, "intermediate_state.pth")
     if cfg.impl.resume_run_after_preempt and os.path.isfile(checkpoint_rendevous):
         try:
             metadata = torch.load(checkpoint_rendevous, map_location=torch.device("cpu"))["metadata"]
@@ -31,7 +33,22 @@ def main_training_process(cfg, setup):
     else:
         initial_step, elapsed_time = 0, 0.0
 
-    model_engine, _, _, dataloader = cramming.load_backend(model, dataset, tokenizer, cfg.train, cfg.impl, elapsed_time, setup=setup)
+    model_engine, _, _, dataloader = cramming.load_backend(model, train_dataset, tokenizer, cfg.train, cfg.impl, elapsed_time, setup=setup)
+    eval_dataloader = None
+    if eval_dataset is not None:
+        eval_dataloader = prepare_pretraining_dataloader(
+            eval_dataset,
+            tokenizer,
+            cfg.train,
+            cfg.impl,
+            infinite=False,
+            shuffle=False,
+            masking_seed=cfg.validation.seed if cfg.validation.fixed_masks else None,
+        )
+        log.info(
+            f"Pretraining validation enabled with {len(train_dataset):,} train blocks and {len(eval_dataset):,} eval blocks. "
+            f"Eval interval: {cfg.validation.interval} steps. Fixed eval masks: {cfg.validation.fixed_masks}."
+        )
     if cfg.impl.resume_run_after_preempt and os.path.isfile(checkpoint_rendevous):
         log.info(f"Loading intermediate checkpoint from previous run onto device {cfg.impl.local_rank}...")
         model_engine.load_training_checkpoint(checkpoint_rendevous)
@@ -64,6 +81,9 @@ def main_training_process(cfg, setup):
                 training_allowed = False
                 log.info("Loss higher than allowed threshold. Stopping training early...")
 
+        if eval_dataloader is not None and step % cfg.validation.interval == 0:
+            collect_validation_stats(step, stats, model_engine, eval_dataloader, cfg)
+
         # Checkpointing is triggered from stopping criteria and normal intervals
         if cfg.impl.save_intermediate_checkpoints and step % cfg.impl.save_every_nth_step == 0:
             if loss.detach().isfinite() and cramming.utils.is_main_process() and not cfg.dryrun:
@@ -94,12 +114,85 @@ def main_training_process(cfg, setup):
         if loss.detach().isfinite():
             now = datetime.datetime.now()
             long_checkpoint_id = f"{''.join(cfg.arch.architectures)}_{now.strftime('%Y-%m-%d')}_{loss:2.4f}"
-            model_engine.save_final_model(os.path.join(cfg.base_dir, cfg.name), long_checkpoint_id, tokenizer, cfg.arch, cfg.dryrun)
+            model_engine.save_final_model(cfg.run_dir, long_checkpoint_id, tokenizer, cfg.arch, cfg.dryrun)
 
             if cfg.impl.push_to_huggingface_hub:
                 model_engine.push_to_hub(tokenizer, cfg, dryrun=cfg.dryrun)
     metrics = dict(num_params=sum([p.numel() for p in model.parameters()]))
     return metrics
+
+
+def split_pretraining_dataset(dataset, validation_cfg, k_fold_cfg=None):
+    if getattr(k_fold_cfg, "enabled", False):
+        return split_pretraining_dataset_for_kfold(dataset, validation_cfg, k_fold_cfg)
+    if not validation_cfg.enabled or validation_cfg.split <= 0:
+        return dataset, None
+    if isinstance(dataset, torch.utils.data.IterableDataset):
+        raise ValueError("Validation during pretraining requires a map-style dataset, but an IterableDataset was given.")
+
+    dataset_size = len(dataset)
+    if dataset_size < 2:
+        raise ValueError("Validation split requires at least 2 pretraining blocks.")
+
+    if validation_cfg.split >= 1:
+        eval_size = int(validation_cfg.split)
+    else:
+        eval_size = int(round(dataset_size * validation_cfg.split))
+    eval_size = min(max(1, eval_size), dataset_size - 1)
+
+    generator = torch.Generator().manual_seed(validation_cfg.seed)
+    shuffled_indices = torch.randperm(dataset_size, generator=generator).tolist()
+    eval_indices = shuffled_indices[:eval_size]
+    train_indices = shuffled_indices[eval_size:]
+
+    train_dataset = dataset.select(train_indices)
+    eval_dataset = dataset.select(eval_indices)
+    train_dataset.set_format("torch")
+    eval_dataset.set_format("torch")
+    return train_dataset, eval_dataset
+
+
+def split_pretraining_dataset_for_kfold(dataset, validation_cfg, k_fold_cfg):
+    if isinstance(dataset, torch.utils.data.IterableDataset):
+        raise ValueError("K-fold pretraining requires a map-style dataset, but an IterableDataset was given.")
+
+    dataset_size = len(dataset)
+    num_folds = int(k_fold_cfg.num_folds)
+    current_fold = int(k_fold_cfg.current_fold)
+    split_seed = int(k_fold_cfg.seed)
+
+    if num_folds < 2:
+        raise ValueError("K-fold pretraining requires num_folds >= 2.")
+    if current_fold < 1 or current_fold > num_folds:
+        raise ValueError(f"K-fold pretraining requires current_fold in [1, {num_folds}], got {current_fold}.")
+    if dataset_size < num_folds:
+        raise ValueError(
+            f"K-fold pretraining requires at least as many dataset blocks as folds. "
+            f"Got dataset_size={dataset_size} and num_folds={num_folds}."
+        )
+
+    generator = torch.Generator().manual_seed(split_seed)
+    shuffled_indices = torch.randperm(dataset_size, generator=generator).tolist()
+
+    fold_size = dataset_size // num_folds
+    fold_index = current_fold - 1
+    start_idx = fold_index * fold_size
+    end_idx = start_idx + fold_size if fold_index < num_folds - 1 else dataset_size
+
+    eval_indices = shuffled_indices[start_idx:end_idx]
+    train_indices = shuffled_indices[:start_idx] + shuffled_indices[end_idx:]
+
+    train_dataset = dataset.select(train_indices)
+    eval_dataset = dataset.select(eval_indices)
+    train_dataset.set_format("torch")
+    eval_dataset.set_format("torch")
+
+    log.info(
+        f"K-fold pretraining enabled: fold {current_fold}/{num_folds} with split seed {split_seed}. "
+        f"Train blocks: {len(train_dataset):,}. Eval blocks: {len(eval_dataset):,}. "
+        f"Validation interval: {validation_cfg.interval} steps. Fixed eval masks: {validation_cfg.fixed_masks}."
+    )
+    return train_dataset, eval_dataset
 
 
 def check_deadline(launch_time, hour_limit):
@@ -149,6 +242,56 @@ def collect_stats(step, loss_vals, train_time, stats, model_engine, dataloader, 
     loss_vals = []
     train_time = time.time()
     return loss_vals, train_time
+
+
+@torch.no_grad()
+def collect_validation_stats(step, stats, model_engine, eval_dataloader, cfg):
+    was_training = model_engine.training
+    model_engine.eval()
+
+    if cfg.validation.fixed_masks and hasattr(eval_dataloader.collate_fn, "reset_masking_rng"):
+        eval_dataloader.collate_fn.reset_masking_rng()
+
+    eval_start = time.time()
+    loss_sum = torch.zeros(1, device=model_engine.setup["device"], dtype=torch.float32)
+    batch_count = torch.zeros(1, device=model_engine.setup["device"], dtype=torch.float32)
+
+    for batch_idx, batch in enumerate(eval_dataloader, start=1):
+        device_batch = model_engine.to_device(batch)
+        loss = model_engine.forward(**device_batch)["loss"]
+        loss_sum += loss.detach().float()
+        batch_count += 1
+
+        if cfg.validation.max_batches is not None and batch_idx >= cfg.validation.max_batches:
+            break
+
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(loss_sum, torch.distributed.ReduceOp.SUM, async_op=False)
+        torch.distributed.all_reduce(batch_count, torch.distributed.ReduceOp.SUM, async_op=False)
+
+    eval_loss = (loss_sum / batch_count.clamp_min(1)).item()
+    stats["eval_step"] += [step]
+    stats["eval_loss"] += [eval_loss]
+    stats["best_eval_loss"] += [min(stats["eval_loss"])]
+    stats["eval_time"] += [time.time() - eval_start]
+
+    if was_training:
+        model_engine.train(cfg.train.pretrain_in_train_mode)
+
+    log.info(
+        f"Eval loss {eval_loss:2.4f} at step {step}. "
+        f"[Best: {stats['best_eval_loss'][-1]:2.4f}] "
+        f"Eval time: {stats['eval_time'][-1]:2.2f}s."
+    )
+    cramming.utils.wandb_log(
+        {
+            "eval_step": [step],
+            "eval_loss": [eval_loss],
+            "best_eval_loss": [stats["best_eval_loss"][-1]],
+            "eval_time": [stats["eval_time"][-1]],
+        },
+        cfg,
+    )
 
 
 def engage_troubleshooting(model_engine, step, training_allowed, no_recovery_necessary, cfg):
