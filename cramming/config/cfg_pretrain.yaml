@@ -13,9 +13,9 @@ defaults:
 base_dir: outputs
 hydra:
   sweep:
-    dir: ${base_dir}/${name}/pretrain/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: ${base_dir}/${name}/${now:%Y-%m-%d_%H-%M-%S}_${data.name}
   run:
-    dir: ${base_dir}/${name}/pretrain/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: ${base_dir}/${name}/${now:%Y-%m-%d_%H-%M-%S}_${data.name}
   job:
     chdir: True
 
@@ -29,7 +29,14 @@ dryrun: False
 
 validation:
   enabled: True
-  split: 0.01
+  split: 4096
   interval: 1000
   max_batches:
   seed: 89
+  fixed_masks: True
+
+k_fold:
+  enabled: False
+  num_folds: 10
+  current_fold: 1
+  seed: 42

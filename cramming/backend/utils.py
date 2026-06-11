@@ -60,7 +60,7 @@ def updated_latest_weight_average(model_parameters, model_buffers, store, last_k
     return param_store, buffer_store
 
 
-def _get_pretraining_collate_fn(tokenizer, cfg_train):
+def _get_pretraining_collate_fn(tokenizer, cfg_train, masking_seed=None):
     if cfg_train.objective.name == "masked-lm":
         return PatchedDataCollatorForLanguageModeling(
             tokenizer=tokenizer,
@@ -69,14 +69,15 @@ def _get_pretraining_collate_fn(tokenizer, cfg_train):
             pad_to_multiple_of=8,
             use_80_20_rule=cfg_train.objective.use_80_20_rule,
             token_drop=cfg_train.objective.token_drop,
+            masking_seed=masking_seed,
         )
     return None
 
 
-def prepare_pretraining_dataloader(dataset, tokenizer, cfg_train, cfg_impl, infinite=True, shuffle=None):
+def prepare_pretraining_dataloader(dataset, tokenizer, cfg_train, cfg_impl, infinite=True, shuffle=None, masking_seed=None):
 
     num_workers = get_num_workers(cfg_impl)
-    collate_fn = _get_pretraining_collate_fn(tokenizer, cfg_train)
+    collate_fn = _get_pretraining_collate_fn(tokenizer, cfg_train, masking_seed=masking_seed)
     shuffle = cfg_impl.shuffle_in_dataloader if shuffle is None else shuffle
 
     if isinstance(dataset, torch.utils.data.IterableDataset):
@@ -165,12 +166,34 @@ at commit f00f22a3e290fd377b979124dcf9800b3d73eb11"""
 
 
 class PatchedDataCollatorForLanguageModeling(transformers.DataCollatorForLanguageModeling):
-    def __init__(self, *args, use_80_20_rule=True, token_drop=False, **kwargs):
+    def __init__(self, *args, use_80_20_rule=True, token_drop=False, masking_seed=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_80_20_rule = use_80_20_rule
         self.token_drop = token_drop
+        self.masking_seed = masking_seed
 
         self.mask_token = self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
+        self.reset_masking_rng()
+
+    def reset_masking_rng(self):
+        if self.masking_seed is None:
+            self.masking_generator = None
+            return
+
+        self.masking_generator = torch.Generator()
+        self.masking_generator.manual_seed(self.masking_seed)
+
+    def _rand(self, shape, device, dtype=torch.float32):
+        kwargs = dict(size=shape, device=device, dtype=dtype)
+        if self.masking_generator is not None:
+            kwargs["generator"] = self.masking_generator
+        return torch.rand(**kwargs)
+
+    def _randint(self, high, shape, device, dtype):
+        kwargs = dict(low=0, high=high, size=shape, device=device, dtype=dtype)
+        if self.masking_generator is not None:
+            kwargs["generator"] = self.masking_generator
+        return torch.randint(**kwargs)
 
     def torch_mask_tokens(self, inputs=None, special_tokens_mask=None):
         """
@@ -184,7 +207,8 @@ class PatchedDataCollatorForLanguageModeling(transformers.DataCollatorForLanguag
         labels = inputs.clone()
 
         number_of_masks = round(self.mlm_probability * inputs.shape[1])
-        mask_locations = torch.argsort(torch.randint_like(inputs, inputs.shape[1]))[:, :number_of_masks]
+        mask_scores = self._randint(inputs.shape[1], inputs.shape, device=inputs.device, dtype=inputs.dtype)
+        mask_locations = torch.argsort(mask_scores, dim=1)[:, :number_of_masks]
         # this was slightly fudged to be faster. A draw of torch.rand would be more random, but take slightly longer to sort
 
         masked_indices = torch.zeros_like(inputs, dtype=torch.bool)
@@ -204,7 +228,7 @@ class PatchedDataCollatorForLanguageModeling(transformers.DataCollatorForLanguag
 
             indices_random = torch.zeros_like(inputs, dtype=torch.bool)
             indices_random.scatter_(1, next_10percent_mask_locations, 1)
-            random_words = torch.randint(len(self.tokenizer), labels.shape, dtype=inputs.dtype)
+            random_words = self._randint(len(self.tokenizer), labels.shape, device=inputs.device, dtype=inputs.dtype)
             inputs[indices_random] = random_words[indices_random]
 
             # The rest of the time (10% of the time) we keep the masked input tokens unchanged
@@ -225,7 +249,7 @@ class PatchedDataCollatorForLanguageModeling(transformers.DataCollatorForLanguag
         """
         labels = inputs.clone()
         # We sample a few tokens in each sequence for MLM training (with probability `self.mlm_probability`)
-        probability_matrix = torch.full(labels.shape, self.mlm_probability)
+        probability_matrix = torch.full(labels.shape, self.mlm_probability, device=labels.device)
         if special_tokens_mask is None:
             special_tokens_mask = [self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()]
             special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool)
@@ -233,18 +257,18 @@ class PatchedDataCollatorForLanguageModeling(transformers.DataCollatorForLanguag
             special_tokens_mask = special_tokens_mask.bool()
 
         probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
-        masked_indices = torch.bernoulli(probability_matrix).bool()
+        masked_indices = self._rand(labels.shape, device=labels.device) < probability_matrix
 
         labels[~masked_indices] = -100  # We only compute loss on masked tokens
 
         if self.use_80_20_rule:
             # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
-            indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
+            indices_replaced = (self._rand(labels.shape, device=labels.device) < 0.8) & masked_indices
             inputs[indices_replaced] = self.mask_token
 
             # 10% of the time, we replace masked input tokens with random word
-            indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-            random_words = torch.randint(len(self.tokenizer), labels.shape, dtype=inputs.dtype)
+            indices_random = (self._rand(labels.shape, device=labels.device) < 0.5) & masked_indices & ~indices_replaced
+            random_words = self._randint(len(self.tokenizer), labels.shape, device=inputs.device, dtype=inputs.dtype)
             inputs[indices_random] = random_words[indices_random]
 
             # The rest of the time (10% of the time) we keep the masked input tokens unchanged
@@ -303,7 +327,7 @@ class PatchedDataCollatorForLanguageModeling(transformers.DataCollatorForLanguag
         """
         reduced_seq_length = int(input_ids.shape[1] * (1 - self.token_drop))
         # There is probably a faster way to do this, but this works for now?
-        token_mask = torch.argsort(torch.rand_like(input_ids, dtype=torch.float), dim=-1)
+        token_mask = torch.argsort(self._rand(input_ids.shape, device=input_ids.device), dim=-1)
         fixed_mask = input_ids.scatter(1, token_mask[:, :reduced_seq_length], -1) == -1
         return input_ids[fixed_mask].view(input_ids.shape[0], -1), labels[fixed_mask].view(input_ids.shape[0], -1)
 
