@@ -5,8 +5,19 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import matplotlib.pyplot as plt
+import numpy as np
 
 
+# Usage examples:
+#   python graph.py
+#   python graph.py -i
+#   python graph.py --compare-sinusoid
+#   python graph.py --compare-sinusoid -f
+#   python graph.py -i --compare-sinusoid -f
+# Arguments:
+#   -i, --individual       Save individual graphs for each wave.
+#   --compare-sinusoid     Save log-scale comparisons of each wave against sinusoid.
+#   -f, --final-only       With --compare-sinusoid, also save versions from step 600000 onward.
 # Embed TrueType fonts in PDFs for better portability.
 plt.rcParams["pdf.fonttype"] = "truetype"
 
@@ -22,6 +33,8 @@ WAVE_COLORS = {
     "sawtooth": "orange",
 }
 VAL_LOSS_KEYS = ("val_loss", "valid_loss", "validation_loss", "test_loss", "eval_loss")
+MOVING_AVERAGE_WINDOW = 60
+RUN_DIR_TIMESTAMP_FORMAT = "%Y-%m-%d_%H-%M-%S"
 
 
 def load_rows(csv_path: Path) -> List[Dict[str, str]]:
@@ -31,16 +44,28 @@ def load_rows(csv_path: Path) -> List[Dict[str, str]]:
 
 def parse_run_timestamp(csv_path: Path) -> datetime:
     run_dir = csv_path.parent
-    timestamp = f"{run_dir.parent.name} {run_dir.name}"
-    return datetime.strptime(timestamp, "%Y-%m-%d %H-%M-%S")
+    try:
+        return datetime.strptime(run_dir.name[:19], RUN_DIR_TIMESTAMP_FORMAT)
+    except ValueError:
+        timestamp = f"{run_dir.parent.name} {run_dir.name}"
+        return datetime.strptime(timestamp, "%Y-%m-%d %H-%M-%S")
+
+
+def is_new_run_layout(csv_path: Path) -> bool:
+    try:
+        datetime.strptime(csv_path.parent.name[:19], RUN_DIR_TIMESTAMP_FORMAT)
+    except ValueError:
+        return False
+    return True
 
 
 def find_latest_csv_for_wave(wave: str) -> Path:
-    pattern = f"cramming_{wave}_single/pretrain/*/*/table_cramming_{wave}_single_convergence_results.csv"
-    candidates = list(OUTPUTS_DIR.glob(pattern))
+    new_pattern = f"cramming_{wave}_single/*/table_cramming_{wave}_single_convergence_results.csv"
+    legacy_pattern = f"cramming_{wave}_single/pretrain/*/*/table_cramming_{wave}_single_convergence_results.csv"
+    candidates = list(OUTPUTS_DIR.glob(new_pattern)) + list(OUTPUTS_DIR.glob(legacy_pattern))
     if not candidates:
         raise FileNotFoundError(f"No convergence CSV found for wave '{wave}'.")
-    return max(candidates, key=parse_run_timestamp)
+    return max(candidates, key=lambda csv_path: (parse_run_timestamp(csv_path), is_new_run_layout(csv_path)))
 
 
 def extract_series(rows: List[Dict[str, str]], key: str) -> List[float]:
@@ -63,6 +88,16 @@ def find_validation_key(rows: List[Dict[str, str]]) -> Optional[str]:
     return None
 
 
+def apply_moving_average(steps: List[float], values: List[float], window: int = MOVING_AVERAGE_WINDOW) -> tuple[List[float], List[float]]:
+    if len(values) < window or window <= 1:
+        return steps, values
+
+    kernel = np.ones(window, dtype=float) / window
+    smoothed_values = np.convolve(values, kernel, mode="valid").tolist()
+    smoothed_steps = steps[window - 1 :]
+    return smoothed_steps, smoothed_values
+
+
 def draw_loss_comparison(
     series_by_wave: Dict[str, Dict[str, object]], save_path: Path, log_scale: bool = False
 ) -> None:
@@ -70,8 +105,7 @@ def draw_loss_comparison(
 
     validation_key = None
     for wave, info in series_by_wave.items():
-        steps = info["steps"]
-        train_loss = info["train_loss"]
+        steps, train_loss = apply_moving_average(info["steps"], info["train_loss"])
         validation_key = validation_key or info["validation_key"]
         plt.plot(
             steps,
@@ -84,18 +118,20 @@ def draw_loss_comparison(
 
         val_loss = info["val_loss"]
         if val_loss:
+            val_steps = info["val_steps"]
+            val_steps, val_loss = apply_moving_average(val_steps, val_loss)
             plt.plot(
-                steps[: len(val_loss)],
+                val_steps,
                 val_loss,
                 color=WAVE_COLORS[wave],
                 linestyle="--",
                 linewidth=2,
-                label=f"{wave.capitalize()} Validation Loss",
+                label=f"{wave.capitalize()} Eval Loss",
             )
 
     plt.xlabel("Step", fontsize=12)
     plt.ylabel("Loss (log scale)" if log_scale else "Loss", fontsize=12)
-    title = "Training and Validation Loss vs Step" if validation_key else "Training Loss vs Step"
+    title = "Training and Eval Loss vs Step" if validation_key else "Training Loss vs Step"
     if log_scale:
         title += " (Log Scale)"
     plt.title(title, fontsize=14)
@@ -113,8 +149,7 @@ def draw_individual_wave_graph(
 ) -> None:
     plt.figure(figsize=(10, 6))
 
-    steps = info["steps"]
-    train_loss = info["train_loss"]
+    steps, train_loss = apply_moving_average(info["steps"], info["train_loss"])
     validation_key = info["validation_key"]
     plt.plot(
         steps,
@@ -127,19 +162,21 @@ def draw_individual_wave_graph(
 
     val_loss = info["val_loss"]
     if val_loss:
+        val_steps = info["val_steps"]
+        val_steps, val_loss = apply_moving_average(val_steps, val_loss)
         plt.plot(
-            steps[: len(val_loss)],
+            val_steps,
             val_loss,
             color=WAVE_COLORS[wave],
             linestyle="--",
             linewidth=2,
-            label=f"{wave.capitalize()} Validation Loss",
+            label=f"{wave.capitalize()} Eval Loss",
         )
 
     plt.xlabel("Step", fontsize=12)
     plt.ylabel("Loss (log scale)" if log_scale else "Loss", fontsize=12)
     title = (
-        f"{wave.capitalize()} Training and Validation Loss vs Step"
+        f"{wave.capitalize()} Training and Eval Loss vs Step"
         if validation_key
         else f"{wave.capitalize()} Training Loss vs Step"
     )
@@ -167,8 +204,7 @@ def draw_sinusoid_comparison(
     plt.figure(figsize=(10, 6))
 
     for wave, info in ((baseline_wave, baseline_info), (compare_wave, compare_info)):
-        steps = info["steps"]
-        train_loss = info["train_loss"]
+        steps, train_loss = apply_moving_average(info["steps"], info["train_loss"])
 
         if final_only:
             filtered_pairs = [(step, loss) for step, loss in zip(steps, train_loss) if step >= final_step_threshold]
@@ -185,11 +221,31 @@ def draw_sinusoid_comparison(
             label=f"{wave.capitalize()} Train Loss",
         )
 
+        val_loss = info["val_loss"]
+        if val_loss:
+            val_steps, smoothed_val_loss = apply_moving_average(info["val_steps"], val_loss)
+            if final_only:
+                filtered_pairs = [
+                    (step, loss) for step, loss in zip(val_steps, smoothed_val_loss) if step >= final_step_threshold
+                ]
+                if not filtered_pairs:
+                    continue
+                val_steps, smoothed_val_loss = zip(*filtered_pairs)
+
+            plt.plot(
+                val_steps,
+                smoothed_val_loss,
+                color=WAVE_COLORS[wave],
+                linestyle="--",
+                linewidth=2,
+                label=f"{wave.capitalize()} Eval Loss",
+            )
+
     plt.xlabel("Step", fontsize=12)
     plt.ylabel("Loss (log scale)", fontsize=12)
     title_suffix = f" from Step {final_step_threshold}" if final_only else ""
     plt.title(
-        f"{baseline_wave.capitalize()} vs {compare_wave.capitalize()} Training Loss{title_suffix} (Log Scale)",
+        f"{baseline_wave.capitalize()} vs {compare_wave.capitalize()} Train and Eval Loss{title_suffix} (Log Scale)",
         fontsize=14,
     )
     plt.yscale("log")
@@ -249,6 +305,7 @@ def main() -> None:
             "steps": extract_series(rows, "step"),
             "train_loss": extract_series(rows, "loss"),
             "validation_key": validation_key,
+            "val_steps": extract_series(rows, "eval_step") if "eval_step" in rows[0] else extract_series(rows, "step"),
             "val_loss": extract_series(rows, validation_key) if validation_key else [],
         }
         print(f"Using {wave}: {csv_path}")
