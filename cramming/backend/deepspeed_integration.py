@@ -83,7 +83,7 @@ def save_training_checkpoint(self, identifier, directory="checkpoints", state=No
 
 def save_final_model(self, base_directory, identifier, tokenizer, cfg_arch, dryrun=False):
     """This checkpoint can be used for downstream tasks.
-    The default behavior is to save this checkpoint to a checkpoints folder under base_directory/name/checkpoints"""
+    The default behavior is to save this checkpoint to a checkpoints folder under the active run directory."""
     try:
         identifier_str = f"{identifier:2.4f}"
     except ValueError:

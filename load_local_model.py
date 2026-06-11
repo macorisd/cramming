@@ -33,7 +33,7 @@ def main_load_process(cfg, setup):
         # Save final checkpoint somewhere else?:
         # now = datetime.datetime.now()
         # checkpoint_id = f"{''.join(cfg.arch.architectures)}_{now.strftime('%Y-%m-%d')}_{float('NaN'):2.4f}"
-        # model_engine.save_final_model(os.path.join(cfg.base_dir, cfg.name), checkpoint_id, tokenizer, cfg.arch, cfg.dryrun)
+        # model_engine.save_final_model(cfg.run_dir, checkpoint_id, tokenizer, cfg.arch, cfg.dryrun)
 
         # Save to hub
         if cfg.impl.push_to_huggingface_hub:

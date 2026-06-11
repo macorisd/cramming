@@ -5,6 +5,7 @@ import sys
 
 import os
 import csv
+import re
 import yaml
 import psutil
 import pynvml
@@ -31,6 +32,8 @@ from omegaconf import OmegaConf, open_dict
 
 log = logging.getLogger(__name__)
 os.environ["HYDRA_FULL_ERROR"] = "0"
+RUN_DIR_TIMESTAMP_FORMAT = "%Y-%m-%d_%H-%M-%S"
+RUN_DIR_TIMESTAMP_RE = re.compile(r"^(?P<timestamp>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})(?:_.+)?$")
 
 
 def main_launcher(cfg, main_fn, job_name=""):
@@ -188,23 +191,80 @@ def num_processes():
     return num_procs
 
 
+def parse_run_dir_timestamp(name):
+    match = RUN_DIR_TIMESTAMP_RE.match(name)
+    if match is None:
+        return None
+    return datetime.datetime.strptime(match.group("timestamp"), RUN_DIR_TIMESTAMP_FORMAT)
+
+
+def list_named_run_directories(run_root):
+    if not os.path.isdir(run_root):
+        return []
+
+    run_directories = []
+    for entry in os.scandir(run_root):
+        if not entry.is_dir() or entry.name == "checkpoints":
+            continue
+        timestamp = parse_run_dir_timestamp(entry.name)
+        if timestamp is not None:
+            run_directories.append((timestamp, entry.path))
+    return sorted(run_directories, key=lambda item: item[0])
+
+
+def list_checkpoint_directories(cfg):
+    run_root = os.path.join(cfg.base_dir, cfg.name)
+    checkpoint_directories = []
+
+    for run_timestamp, run_dir in list_named_run_directories(run_root):
+        checkpoint_dir = os.path.join(run_dir, "checkpoints")
+        if os.path.isdir(checkpoint_dir):
+            checkpoint_directories.append((run_timestamp, checkpoint_dir))
+
+    legacy_checkpoint_dir = os.path.join(run_root, "checkpoints")
+    if os.path.isdir(legacy_checkpoint_dir):
+        checkpoint_directories.append((datetime.datetime.min, legacy_checkpoint_dir))
+
+    return checkpoint_directories
+
+
+def list_checkpoint_candidates(cfg):
+    candidates = []
+    for run_timestamp, checkpoint_dir in list_checkpoint_directories(cfg):
+        for entry in os.scandir(checkpoint_dir):
+            if entry.is_dir():
+                candidates.append((run_timestamp, entry.path))
+    return candidates
+
+
+def extract_checkpoint_loss(checkpoint_path):
+    try:
+        return float(os.path.basename(checkpoint_path).rsplit("_", 1)[-1])
+    except ValueError:
+        return float("inf")
+
+
 def find_pretrained_checkpoint(cfg, downstream_classes=None):
     """Load a checkpoint either locally or from the internet."""
-    local_checkpoint_folder = os.path.join(cfg.base_dir, cfg.name, "checkpoints")
+    checkpoint_candidates = list_checkpoint_candidates(cfg)
     if cfg.eval.checkpoint == "latest":
-        # Load the latest local checkpoint
-        all_checkpoints = [f for f in os.listdir(local_checkpoint_folder)]
-        checkpoint_paths = [os.path.join(local_checkpoint_folder, c) for c in all_checkpoints]
-        checkpoint_name = max(checkpoint_paths, key=os.path.getmtime)
+        if len(checkpoint_candidates) == 0:
+            raise FileNotFoundError(f"No checkpoint directories found for run name '{cfg.name}'.")
+        checkpoint_name = max(checkpoint_candidates, key=lambda item: (item[0], os.path.getmtime(item[1])))[1]
     elif cfg.eval.checkpoint == "smallest":
-        # Load maybe the local checkpoint with smallest loss
-        all_checkpoints = [f for f in os.listdir(local_checkpoint_folder)]
-        checkpoint_paths = [os.path.join(local_checkpoint_folder, c) for c in all_checkpoints]
-        checkpoint_losses = [float(path[-5:]) for path in checkpoint_paths]
-        checkpoint_name = checkpoint_paths[np.argmin(checkpoint_losses)]
+        if len(checkpoint_candidates) == 0:
+            raise FileNotFoundError(f"No checkpoint directories found for run name '{cfg.name}'.")
+        checkpoint_name = min(checkpoint_candidates, key=lambda item: extract_checkpoint_loss(item[1]))[1]
     elif not os.path.isabs(cfg.eval.checkpoint) and not cfg.eval.checkpoint.startswith("hf://"):
-        # Look locally for a checkpoint with this name
-        checkpoint_name = os.path.join(local_checkpoint_folder, cfg.eval.checkpoint)
+        checkpoint_name = None
+        for _, checkpoint_dir in sorted(list_checkpoint_directories(cfg), key=lambda item: item[0], reverse=True):
+            candidate_path = os.path.join(checkpoint_dir, cfg.eval.checkpoint)
+            if os.path.isdir(candidate_path):
+                checkpoint_name = candidate_path
+                break
+        if checkpoint_name is None:
+            legacy_candidate = os.path.join(cfg.base_dir, cfg.name, "checkpoints", cfg.eval.checkpoint)
+            checkpoint_name = legacy_candidate
     elif cfg.eval.checkpoint.startswith("hf://"):
         # Download this checkpoint directly from huggingface
         model_name = cfg.eval.checkpoint.split("hf://")[1].removesuffix("-untrained")
@@ -526,4 +586,5 @@ def pathfinder(cfg):
         cfg.impl.path = os.path.expanduser(cfg.impl.path)
         if not os.path.isabs(cfg.impl.path):
             cfg.impl.path = os.path.join(cfg.base_dir, cfg.impl.path)
+        cfg.run_dir = os.getcwd()
     return cfg
