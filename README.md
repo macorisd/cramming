@@ -1,3 +1,11 @@
+# Cramming architecture - Master's Thesis by Macorís Decena Giménez
+
+This fork was developed as part of my Master's Thesis, which studies the replacement of the original sinusoidal positional encoding used in Transformer-based architectures with alternative periodic functions. In this repository, the Cramming pretraining framework has been adapted to support different positional encoding waveforms, k-fold experimental validation, and datasets from several sequence domains.
+
+The trained model weights are available in Google Drive: [https://drive.google.com/drive/folders/1IxeLRsapGrlCpydSH6j553VWeqcCe1LQ?usp=sharing](https://drive.google.com/drive/folders/1IxeLRsapGrlCpydSH6j553VWeqcCe1LQ?usp=sharing)
+
+---
+
 # Cramming Language Model (Pretraining)
 
 This repository contains code to replicate our research described in "Cramming: Training a Language Model on a Single GPU in One Day". We experiment with language model pretraining a BERT-type model with limited compute, wondering "how bad can it really be"?
