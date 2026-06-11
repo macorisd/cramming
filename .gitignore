@@ -1,4 +1,7 @@
 outputs
+outputs-kfold/
+graphs/
+graphs_k_fold/
 tables/*/*.csv
 tables/*/*.csv#
 tables/*.csv
@@ -8,6 +11,8 @@ tables/*.ods
 torch_compile_debug
 checkpoints
 wandb-metadata.json
+*.out
+*.err
 
 dedup
 
